@@ -12,6 +12,7 @@ use IO::Async::Timer::Periodic;
 use Net::Async::IRC;
 use Protocol::IRC::Message;
 use JSON;
+use Encode qw(encode_utf8);
 
 use Data::Dumper;
 
@@ -23,23 +24,65 @@ use constant
 	TWITCH_OAUTH_SCOPES => "chat:edit chat:read whispers:read whispers:edit",
 	TWITCH_OAUTH_CALLBACK => "http://localhost",
 	TWITCH_IRC_URI => "irc.chat.twitch.tv",
+	TWITCH_SJOW_SHANNEL_ID => "22588033",
+	TWITCH_SJOW_SHANNEL => "https://www.twitch.tv/sjow",
+	TWITCH_GQL_URI => "https://gql.twitch.tv/gql",
+	TWITCH_PUBSUB_WS_URI => "wss://pubsub-edge.twitch.tv/v1",
+	
+	HS_DECK_TRACKER_TOPIC => "channel-ext-v1.22588033-apwln3g3ia45kk690tzabfp525h9e1-broadcast",
 	
 	IRC_BOT_NAME => "woosterb0t",
-	IRC_BOT_OWNER_LIST => ["jeevesmkii"]
+	IRC_CHANNEL => "#sjow",
+	IRC_BOT_OWNER_LIST => ["jeevesmkii"],
+	IRC_CHAT_COOLDOWN => 10
 	};
-	
+
 use constant
 	{
 	HS_STATE_ROUND_OVER => 0,
 	HS_STATE_ROUND_PREPARING => 1,
 	HS_STATE_ROUND_IN_PROGRESS => 2
 	};
+	
+my @chat_responses =
+	(
+	{ trigger => "wot ho", owneronly => 1, response => "Wot ho, Yeeves! gachiTip"}
+	);
 
-my $sjow_shannel_id = "22588033";
-my $sjow_shannel = "https://www.twitch.tv/sjow";
-my $twitch_gql = "https://gql.twitch.tv/gql";
-my $twitch_pubsub = "wss://pubsub-edge.twitch.tv/v1";
-my $deck_tracker_topic = "channel-ext-v1.22588033-apwln3g3ia45kk690tzabfp525h9e1-broadcast";
+my @chat_commands =
+	{
+	( command => "howlaki", owneronly => 0, response => \&irc_print_stats )
+	};
+
+# a proper exponential scale might be more """acurate""", but we're optimising for maximum lulz
+# practicaly speaking, anything beyond -10 -> +10 won't really happen excepting tiny sample sizes.
+my @laki_scale =
+	(
+	{ "threshold" => -90, "emote" => "FeelsStrongMan", "index" => 0, "comment" => "FUF! FAK! BabyRage"},
+	{ "threshold" => -60, "emote" => "NotLikeThis", "index" => 0, "comment" => "Unluckiest man alive. NODDERS"},
+	{ "threshold" => -40, "emote" => "BabyRage", "index" => 0, "comment" => "That's it, I'm going back to SC2. SwiftRage"},
+	{ "threshold" => -20, "emote" => "PepeHands", "index" => 0, "comment" => "Oh no, shat. NotLikeThis"},
+	{ "threshold" => -10,  "emote" => "verySadge", "index" => 0, "comment" => "Don't KEKW shat!"},
+	{ "threshold" => -8, "emote" => "Sadge", "index" => 0, "comment" => "Paid actors. MaN"},
+	{ "threshold" => -6, "emote" => "FeelsRainMan", "index" => 0, "comment" => "It's lag, guys! Lageg"},
+	{ "threshold" => -5, "emote" => "peepoSad", "index" => 1, "comment" => "They keep stealing my greasebot! MrDestructoid"},
+	{ "threshold" => -4, "emote" => "FeelsBadMan", "index" => 1, "comment" => "Poison is sheet. FishMoley"},
+	{ "threshold" => -3, "emote" => "NOP", "index" => 1, "comment" => "Why am I never fakking laki? PepeHands"},
+	{ "threshold" => -2, "emote" => "pepeW", "index" => 1, "comment" => "Things will turn around Shirley"},
+	{ "threshold" => -1, "emote" => "FeelsWeirdMan", "index" => 1, "comment" => "It's just variance, shat. peepoStrongest"},
+	{ "threshold" => 1, "emote" => "FeelsOkayMan", "index" => 2, "comment" => "What average RNG feels like. forsenSmug"},
+	{ "threshold" => 2, "emote" => "peepoBlanket", "index" => 3, "comment" => "Just warming up. Clueless"},
+	{ "threshold" => 3, "emote" => "FeelsGoodMan", "index" => 3, "comment" => "All skill, guys. KEKLEO WineTime"},
+	{ "threshold" => 4, "emote" => "peepoHappy", "index" => 3, "comment" => "It's all about the APM. BBoomer"},
+	{ "threshold" => 5, "emote" => "EZ", "index" => 3, "comment" => "Taste my skill. SMOrc"},
+	{ "threshold" => 6, "emote" => "FeelsAmazingMan", "index" => 3, "comment" => "This one's a banger sjowJAM"},
+	{ "threshold" => 8, "emote" => "billyReady", "index" => 4, "comment" => "Sometimes, I play so hard I rip the skin. HMmm"},
+	{ "threshold" => 10, "emote" => "GIGASJOW", "index" => 4, "comment" => "Up noob. forsenLevel"},
+	{ "threshold" => 20, "emote" => "FeelsRareMan", "index" => 4, "comment" => "Your mom likes my RNG. YOURMOM"},
+	{ "threshold" => 40, "emote" => "HandsUp", "index" => 4, "comment" => "God gamer. forsenMaxLevel"},
+	{ "threshold" => 60, "emote" => "gachiHYPER", "index" => 4, "comment" => "SjowPls SjowPls SjowPls SjowPls"},
+	{ "threshold" => 9000, "emote" => "HACKERMANS", "index" => 4, "comment" => "Hao? Sjow is hacking. DANKHACKERMANS"},
+	);
 
 my $http_ua = LWP::UserAgent->new;
 my $cookies = HTTP::Cookies->new(file => "saved.cookies", autosave => 1);
@@ -49,6 +92,7 @@ my $json = JSON->new->allow_nonref;
 my $ws_client = undef;
 my $ping_timer = undef;
 my $irc_client = undef;
+my $irc_last_message = 0;
 
 my $hs_state = HS_STATE_ROUND_OVER;
 my @hs_daily_results = ();
@@ -102,7 +146,7 @@ $ws_client = Net::Async::WebSocket::Client->new(
 		},
 );
 
-# I believe twitch sends it's stupid "ping" messages every 90 seconds
+# I believe twitch sends its stupid "ping" messages every 90 seconds
 $ping_timer = IO::Async::Timer::Periodic->new(
 	interval => 90,
 	
@@ -253,7 +297,8 @@ sub is_owner_message($)
 	my ($nick) = @_;
 	$nick = lc($nick);
 	
-	foreach (IRC_BOT_OWNER_LIST)
+	my $owners = IRC_BOT_OWNER_LIST;
+	foreach (@{$owners})
 		{
 		return 1
 			if ($nick eq $_);
@@ -262,21 +307,97 @@ sub is_owner_message($)
 	return 0;
 	}
 
+sub irc_send_text($$)
+	{
+	my ($channel, $text) = @_;
+	
+	$irc_last_message = time();
+	$irc_client->do_PRIVMSG(target => $channel, text => $text)->get;
+	}
+
+sub irc_print_stats($$)
+	{
+	my ($nick, $channel) = @_;
+	
+	# find the position on the scale the current luck differential falls in to
+	my $scale_entry = undef;
+	my $luck_diff = 100 * ($hs_daily_stats->{actual_luck} - $hs_daily_stats->{expected_luck});
+	my $sign = $luck_diff >= 0 ? "+" : "-";
+	
+	foreach (@laki_scale)
+		{
+		if ($luck_diff < $_->{threshold})
+			{
+			$scale_entry = $_;
+			last;
+			}
+		}
+	
+	$luck_diff = -$luck_diff
+		if ($luck_diff < 0);
+	$luck_diff = 99.99
+		if ($luck_diff >= 100);
+	
+	$scale_entry || return;
+	
+	my @laki_chart = ("\x{1F7E5}", "\x{1F7E5}", "\x{1F7E7}", "\x{1F7E9}", "\x{1F7E9}");
+	$laki_chart[$scale_entry->{index}] = $scale_entry->{emote};
+	
+	my $chart_line = encode_utf8("[ " . join(" ", @laki_chart) . " ] ") . sprintf("%s%.0f%%", $sign, $luck_diff) . "   ";
+	my $quote_line = encode_utf8("\x{1F449}     " .sprintf("%s%.2f%% - %s", $sign, $luck_diff, $scale_entry->{comment}));
+	irc_send_text($channel, $chart_line . $quote_line);
+	}
+
 sub handle_irc_privmsg($)
 	{
 	my ($msg) = @_;
 	
 	my ($nick, $ident, $host) = $msg->prefix_split;
+	my $is_owner = is_owner_message($nick);
+	my $channel = $msg->arg(0);
 	my $text = $msg->arg(1);
-	
-	# comments directly addressed to the bot
 	my $name_match = "@" . IRC_BOT_NAME;
-	if ($text =~ /$name_match/ig)
+	
+	# rate limit our responses
+	if (($irc_last_message + IRC_CHAT_COOLDOWN) > time())
 		{
-		
+		print "rate limited, ignoring!\n";
+		return;
 		}
 	
-	print "privmsg from $nick : $text\n";
+	#commands
+	if ($text =~ /^!([^\s]+)/)
+		{
+		my $command = lc($1);
+		print "read command $command\n";
+		
+		foreach (@chat_commands)
+			{
+			if ($command eq $_->{command})
+				{
+				next
+					unless (!$_->{owneronly} || $is_owner);
+				
+				$_->{response}($nick, $channel);
+				last;
+				}
+			}
+		}
+	# comments directly addressed to the bot
+	elsif ($text =~ /$name_match/ig)
+		{
+		foreach (@chat_responses)
+			{
+			if ($text =~ m/$_->{trigger}/ig)
+				{
+				next
+					unless (!$_->{owneronly} || $is_owner);
+				
+				irc_send_text($channel, $_->{response});
+				last;
+				}
+			}
+		}
 	}
 	
 sub handle_irc_whisper($)
@@ -292,7 +413,7 @@ sub handle_irc_whisper($)
 sub request_shannel_extension_auth_token()
 	{
 	# I really have no idea what the hash is a hash of, but the request doesn't work without it so lets call is a ritual object.
-	my %vars = ("channelID" => $sjow_shannel_id);
+	my %vars = ("channelID" => TWITCH_SJOW_SHANNEL_ID);
 	my %persisted_query = ("version" => 1, "sha256Hash" => "37a5969f117f2f76bc8776a0b216799180c0ce722acb92505c794a9a4f9737e7");
 	my %extensions = ("persistedQuery" => \%persisted_query);
 	my %request_payload = ( 
@@ -304,7 +425,7 @@ sub request_shannel_extension_auth_token()
 	my $json_payload = $json->encode(\%request_payload);
 	
 	# get a client ID by scraping the twitch HTML
-	my $req = HTTP::Request->new("GET", $sjow_shannel);
+	my $req = HTTP::Request->new("GET", TWITCH_SJOW_SHANNEL);
 	my $resp = $http_ua->request($req);
 	
 	$resp->is_success
@@ -315,7 +436,7 @@ sub request_shannel_extension_auth_token()
 	my $client_id = $1;
 	
 	# fetch extension info for sjow's shannel
-	$req = HTTP::Request->new("POST", $twitch_gql);
+	$req = HTTP::Request->new("POST", TWITCH_GQL_URI);
 	$req->header("Content-Type" => "application/json");
 	$req->header("Client-Id" => $client_id);
 	$req->content($json_payload);
@@ -506,14 +627,14 @@ else
 	my $ws_nonce = generate_twitch_ws_nonce();
 
 	# HEY! LISTEN!
-	my @ws_topics = ($deck_tracker_topic);
+	my @ws_topics = (HS_DECK_TRACKER_TOPIC);
 	my %ws_listen_data = ("topics" => \@ws_topics, "auth_token" => $auth_token);
 	my %ws_listen_struct = ("type" => "LISTEN", "nonce" => $ws_nonce, "data" => \%ws_listen_data);
 
 	my $listen_request = $json->encode(\%ws_listen_struct);
 
 	$ws_client->connect(
-		url => $twitch_pubsub
+		url => TWITCH_PUBSUB_WS_URI
 	)->then( sub {
 		$ws_client->send_text_frame($listen_request);
 	})->get;
@@ -528,7 +649,7 @@ else
 		$irc_client->send_message(Protocol::IRC::Message->new_from_line("CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands"));
 		$irc_client->send_message(Protocol::IRC::Message->new_from_line("PASS oauth:" .  $credentials->{UserToken}));
 		$irc_client->send_message(Protocol::IRC::Message->new_from_line("NICK " . IRC_BOT_NAME));
-		$irc_client->send_message(Protocol::IRC::Message->new_from_line("JOIN #jeevesmkii"));
+		$irc_client->send_message(Protocol::IRC::Message->new_from_line("JOIN " . IRC_CHANNEL));
 	})->get;
 	
 	$loop->run;
