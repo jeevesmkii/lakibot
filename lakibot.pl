@@ -1,8 +1,27 @@
+use strict;
+use warnings;
 use LWP::UserAgent; 
+use HTTP::Cookies;
 use HTTP::Request;
+use URI::Encode qw(uri_encode);
 use IO::Async::Loop;
 use Net::Async::WebSocket::Client;
+use IO::Async::Timer::Periodic;
+use Net::Async::IRC;
+use Protocol::IRC::Message;
 use JSON;
+
+use Data::Dumper;
+
+use constant
+	{
+	TWITCH_CLIENT_ID => "p0jsj9zcr60se8wzot50szgymgcwwm",
+	TWITCH_OAUTH_URI => "https://id.twitch.tv/oauth2/authorize",
+	TWITCH_OAUTH_TOKEN_URI => " https://id.twitch.tv/oauth2/token",
+	TWITCH_OAUTH_SCOPES => "chat:edit chat:read whispers:read whispers:edit",
+	TWITCH_OAUTH_CALLBACK => "http://localhost",
+	TWITCH_IRC_URI => "irc.chat.twitch.tv"
+	};
 
 my $sjow_shannel_id = "22588033";
 my $sjow_shannel = "https://www.twitch.tv/sjow";
@@ -11,13 +30,22 @@ my $twitch_pubsub = "wss://pubsub-edge.twitch.tv/v1";
 my $deck_tracker_topic = "channel-ext-v1.22588033-apwln3g3ia45kk690tzabfp525h9e1-broadcast";
 
 my $http_ua = LWP::UserAgent->new;
+my $cookies = HTTP::Cookies->new(file => "saved.cookies", autosave => 1);
+$http_ua->cookie_jar($cookies);
 my $json = JSON->new->allow_nonref;
 
-my $client = Net::Async::WebSocket::Client->new(
+my $ws_client = undef;
+my $ping_timer = undef;
+my $irc_client = undef;
+
+$ws_client = Net::Async::WebSocket::Client->new(
 
 	on_text_frame => sub 
 		{
 		my ( $self, $frame ) = @_;
+		
+		print "message: $frame\n";
+		
 		# ignore frames that can't be decoded
 		my $resp = $json->decode($frame) || return;
 		exists($resp->{type}) || return;
@@ -31,6 +59,9 @@ my $client = Net::Async::WebSocket::Client->new(
 				
 			die "Attempting to connect to twitch websocket returned error: $err"
 				unless $err eq "";
+				
+			# start the ping timer
+			$ping_timer->start;
 			}
 		# but mostly we get messages of type "MESSAGE", original eh?
 		elsif ($resp->{type} eq "MESSAGE")
@@ -51,19 +82,30 @@ my $client = Net::Async::WebSocket::Client->new(
 				}
 			}
 		},
-	
-	on_binary_frame => sub 
-		{
-		my ($self, $frame) = @_;
-		# I don't think twitch sends binary/raw frames ever
-		},
-	
-	on_raw_frame => sub
-		{
-		my ($self, $frame) = @_;
-		# I don't think twitch sends binary/raw frames ever
-		}
 );
+
+# I believe twitch sends it's stupid "ping" messages every 90 seconds
+$ping_timer = IO::Async::Timer::Periodic->new(
+	interval => 90,
+	
+	on_tick => sub
+		{
+		my %ping = ("type" => "PING");
+		my $ping_msg = $json->encode(\%ping);
+		
+		print "sending ping!\n";
+		$ws_client->send_text_frame($ping_msg);
+		}
+	);
+	
+$irc_client = Net::Async::IRC->new(
+	on_message => sub 
+		{
+		my ( $self, $message, $hints ) = @_;
+		print "$message\n";
+		print "$hints\n"
+		}
+	);
 
 sub handle_hearthstone_tracker_msg($)
 	{
@@ -167,24 +209,118 @@ sub generate_twitch_ws_nonce()
 	return $nonce;
 	}
 
-my $loop = IO::Async::Loop->new;
-$loop->add( $client );
+sub get_twitch_credentials()
+	{
+	my $credentials = undef;
+	if (exists $cookies->{COOKIES}->{'example.com'})
+		{
+		my $dummy_cookies = $cookies->{COOKIES}->{'example.com'};
+		if (exists $dummy_cookies->{'/'} && exists $dummy_cookies->{'/'}->{ClientSecret}
+			&& exists $dummy_cookies->{'/'}->{UserToken} && exists $dummy_cookies->{'/'}->{RefreshToken})
+			{
+			$credentials = {
+				"ClientSecret" => $dummy_cookies->{'/'}->{ClientSecret}[1],
+				"UserToken" => $dummy_cookies->{'/'}->{UserToken}[1],
+				"RefreshToken" => $dummy_cookies->{'/'}->{RefreshToken}[1]
+				};
+			}
+		}
+	
+	return $credentials;
+	}
 
-# Tedious shit where we have to get a client ID from twitch HTML and then send it to GQL to get an auth token for HS DT
-my $auth_token = request_shannel_extension_auth_token();
-my $ws_nonce = generate_twitch_ws_nonce();
+my $auth = 0;
 
-# HEY! LISTEN!
-my @ws_topics = ($deck_tracker_topic);
-my %ws_listen_data = ("topics" => \@ws_topics, "auth_token" => $auth_token);
-my %ws_listen_struct = ("type" => "LISTEN", "nonce" => $ws_nonce, "data" => \%ws_listen_data);
+while ($#ARGV >= 0)
+	{
+	$_ = shift @ARGV;
+	if (m/^--auth/) { $auth = 1; }
+	}
 
-my $listen_request = $json->encode(\%ws_listen_struct);
+if ($auth)
+	{
+	# do the interactive auth flow
+	print "Paste the client secret: ";
+	chomp(my $client_secret = <STDIN>);
+	
+	my $auth_url = TWITCH_OAUTH_URI ."?client_id=" . TWITCH_CLIENT_ID 
+		. "&redirect_uri=" . TWITCH_OAUTH_CALLBACK
+		. "&response_type=code&scope=" . uri_encode(TWITCH_OAUTH_SCOPES, { encode_reserved => 1 });
+	
+	print "Use this URL to authorise the bot:\n";
+	print "$auth_url\n";
+	
+	print "Paste the OAUTH master token: ";
+	chomp(my $oauth_master = <STDIN>);
+	
+	# use the master token and client secret to get an intial user token and reset code
+	my $token_post_body = "client_id=" . TWITCH_CLIENT_ID
+		. "&client_secret=" . $client_secret
+		. "&code=" . $oauth_master
+		. "&grant_type=authorization_code&redirect_uri=" . TWITCH_OAUTH_CALLBACK;
+	
+	my $req = HTTP::Request->new("POST", TWITCH_OAUTH_TOKEN_URI);
+	$req->header("Content-Type" => "application/x-www-form-urlencoded");
+	$req->content($token_post_body);
+	
+	my $resp = $http_ua->request($req);
+	$resp->is_success || die "Failed to get access token, reason $!";
+	
+	my $auth_struct = $json->decode($resp->decoded_content);
+	die "No access token in (successful?) authentication response!"
+		unless (exists($auth_struct->{access_token}) && exists($auth_struct->{refresh_token}));
+	
+	# store all this crap in the cookie jar, because lazy.
+	$cookies->set_cookie(1, "ClientSecret", $client_secret, "/", "example.com", 80, 0, 1, 
+			60 * 60 * 24 * 365, 0);
+	$cookies->set_cookie(1, "UserToken", $auth_struct->{access_token}, "/", "example.com", 80, 0, 1, 
+			60 * 60 * 24 * 365, 0);
+	$cookies->set_cookie(1, "RefreshToken", $auth_struct->{refresh_token}, "/", "example.com", 80, 0, 1, 
+			60 * 60 * 24 * 365, 0);
+	
+	print "Authorised successfully!\n";	
+	print "Client Secret: $client_secret\n";
+	print "User Token: $auth_struct->{access_token}\n";
+	print "Refresh Token: $auth_struct->{refresh_token}\n";
+	}
+else
+	{
+	# run the bot
+	my $loop = IO::Async::Loop->new;
+	$loop->add($ws_client);
+	$loop->add($ping_timer);
+	$loop->add($irc_client);
 
-$client->connect(
-   url => $twitch_pubsub
-)->then( sub {
-   $client->send_text_frame($listen_request);
-})->get;
- 
-$loop->run;
+	# Tedious shit where we have to get a client ID from twitch HTML and then send it to GQL to get an auth token for HS DT
+	#my $auth_token = request_shannel_extension_auth_token();
+	#my $ws_nonce = generate_twitch_ws_nonce();
+
+	# HEY! LISTEN!
+	#my @ws_topics = ($deck_tracker_topic);
+	#my %ws_listen_data = ("topics" => \@ws_topics, "auth_token" => $auth_token);
+	#my %ws_listen_struct = ("type" => "LISTEN", "nonce" => $ws_nonce, "data" => \%ws_listen_data);
+
+	#my $listen_request = $json->encode(\%ws_listen_struct);
+
+	#$ws_client->connect(
+	#	url => $twitch_pubsub
+	#)->then( sub {
+	#	$ws_client->send_text_frame($listen_request);
+	#})->get;
+	
+	my $credentials = get_twitch_credentials()
+		|| die "No authentication credentials available, use --auth.";
+	
+	$irc_client->connect(
+		host => TWITCH_IRC_URI,
+		nick => "woosterb0t"
+	)->then( sub {
+		$irc_client->send_message(Protocol::IRC::Message->new_from_line("CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands"));
+		$irc_client->send_message(Protocol::IRC::Message->new_from_line("PASS oauth:" .  $credentials->{UserToken}));
+		$irc_client->send_message(Protocol::IRC::Message->new_from_line("NICK woosterb0t"));
+		$irc_client->send_message(Protocol::IRC::Message->new_from_line("JOIN #jeevesmkii"));
+	})->get;
+	
+	$loop->run;
+	}
+
