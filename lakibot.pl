@@ -51,14 +51,18 @@ my $ping_timer = undef;
 my $irc_client = undef;
 
 my $hs_state = HS_STATE_ROUND_OVER;
+my @hs_daily_results = ();
+my $hs_daily_stats =
+	{
+	expected_luck => 0.5,
+	actual_luck => 0.5
+	};
 
 $ws_client = Net::Async::WebSocket::Client->new(
 
 	on_text_frame => sub 
 		{
 		my ( $self, $frame ) = @_;
-		
-		print "message: $frame\n";
 		
 		# ignore frames that can't be decoded
 		my $resp = $json->decode($frame) || return;
@@ -136,6 +140,38 @@ sub hs_has_probabilities($)
 	
 	return ($probabilities->{win_rate} != 0 || $probabilities->{loss_rate} != 0 || $probabilities->{tie_rate} != 0);
 	}
+	
+sub hs_recalculate_probabilities()
+	{
+	if (scalar @hs_daily_results > 0)
+		{
+		my $cumulative_win_rate = 0;
+		my $cumulative_probability = 0;
+		
+		foreach (@hs_daily_results)
+			{
+			$cumulative_win_rate += $_->{favourable};
+			$cumulative_probability += $_->{probability};
+			}
+			
+		$hs_daily_stats->{actual_luck} = $cumulative_win_rate / scalar @hs_daily_results;
+		$hs_daily_stats->{expected_luck} = $cumulative_probability / scalar @hs_daily_results;
+		}
+	}
+
+sub hs_log_round_outcome($$)
+	{
+	my ($outcome, $probabilities) = @_;
+	
+	# we log two things: 
+	# 1) whether the round has a favourable outcome, defined as a win or a tie.
+	# 2) The probability of a favourable outcome this round (win + tie probability)
+	
+	my $favourable = $outcome >= 0 ? 1 : 0;
+	my $probability = $probabilities->{win_rate} + $probabilities->{tie_rate};
+	push @hs_daily_results, { "favourable" => $favourable, "probability" => $probability };
+	hs_recalculate_probabilities();
+	}
 
 sub handle_hearthstone_tracker_msg($)
 	{
@@ -145,10 +181,7 @@ sub handle_hearthstone_tracker_msg($)
 	return
 		unless (exists($msg->{type}) && exists($msg->{data}));
 	
-	# For now, just print all the relevant info
-	print "HS Deck Tracker Message:\n";
-	print "Message type: $msg->{type}\n";
-	
+	# (round ending message gets to here, if we ever need that)
 	# we need player and opponent boards
 	return
 		unless (exists($msg->{data}->{player}) && exists($msg->{data}->{opponent})
@@ -160,13 +193,6 @@ sub handle_hearthstone_tracker_msg($)
 		unless (exists($msg->{data}->{bobs_buddy_state}) && exists($bb->{loss_rate}) && exists($bb->{win_rate})
 			&& exists($bb->{tie_rate}) && exists($bb->{player_lethal_rate})
 			&& exists($bb->{opponent_lethal_rate}));
-	
-	print "Opponent Lethal Rate: $bb->{player_lethal_rate}\n";
-	print "Win Rate: $bb->{win_rate}\n";
-	print "Tie Rate: $bb->{tie_rate}\n";
-	print "Loss Rate: $bb->{loss_rate}\n";
-	print "Sjow Lethal Rate (KEKW): $bb->{opponent_lethal_rate}\n";
-	print "\n\n";
 	
 	my $probabilities = 
 		{
@@ -211,7 +237,12 @@ sub handle_hearthstone_tracker_msg($)
 				if ($result > 0);
 			print "Round is a loss\n"
 				if ($result < 0);
-				
+			
+			hs_log_round_outcome($result, $probabilities);
+			
+			print "Expected luck: $hs_daily_stats->{expected_luck}\n";
+			print "Actual luck: $hs_daily_stats->{actual_luck}\n";
+			
 			$hs_state = HS_STATE_ROUND_OVER;
 			}
 		}
